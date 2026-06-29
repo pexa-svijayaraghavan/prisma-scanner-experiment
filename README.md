@@ -1,4 +1,4 @@
-# Dotfiles - Recommended documentation/files to improve contribution for PEXA
+# Dotfiles - Recommended documentation/files to improve contribution
 
 Inspired by best practices, culture of documentation and [cgx](https://github.com/jeroenouw/cgx)
 
