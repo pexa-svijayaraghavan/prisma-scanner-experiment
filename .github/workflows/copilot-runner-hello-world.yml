@@ -1,0 +1,186 @@
+name: Copilot Runner Hello World
+
+on:
+  push:
+    branches:
+      - NOJIRA
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  models: read
+
+jobs:
+  copilot-hello-world:
+    name: Ask Copilot from runner
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Preflight runner tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ! command -v gh >/dev/null 2>&1; then
+            echo "::error::gh CLI is required on this runner but was not found"
+            exit 1
+          fi
+
+          if ! command -v python3 >/dev/null 2>&1; then
+            echo "::error::python3 is required on this runner but was not found"
+            exit 1
+          fi
+
+          echo "gh version: $(gh --version | head -n 1)"
+          echo "python3 version: $(python3 --version)"
+
+      - name: Preflight GitHub auth and API reachability
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "::error::GITHUB_TOKEN is not available"
+            exit 1
+          fi
+
+          gh auth status
+          gh api /rate_limit >/dev/null
+
+      - name: Preflight GitHub Models access
+        shell: bash
+        env:
+          MODELS_TOKEN: ${{ secrets.COPILOT_MODELS_TOKEN != '' && secrets.COPILOT_MODELS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${MODELS_TOKEN:-}" ]; then
+            echo "::error::No token available for GitHub Models access"
+            exit 1
+          fi
+
+          echo "Checking models catalog access..."
+          models_status=$(curl -sS -o models-access.json -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${MODELS_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            https://models.github.ai/catalog/models)
+
+          echo "Models catalog HTTP status: ${models_status}"
+
+          if [ "${models_status}" != "200" ]; then
+            echo "::error::GitHub Models access check failed with HTTP ${models_status}"
+            cat models-access.json || true
+            if [ "${models_status}" = "403" ]; then
+              echo "::error::Token/org policy does not allow GitHub Models. Configure repo access and/or provide COPILOT_MODELS_TOKEN with models:read."
+            fi
+            exit 1
+          fi
+
+          echo "Checking inference access for model openai/gpt-4.1-mini..."
+          inference_url="https://models.github.ai/orgs/${GITHUB_REPOSITORY_OWNER}/inference/chat/completions"
+          echo "Inference preflight endpoint: ${inference_url}"
+          cat > preflight-payload.json <<'JSON'
+          {
+            "model": "openai/gpt-4.1-mini",
+            "messages": [
+              {
+                "role": "user",
+                "content": "ping"
+              }
+            ],
+            "max_tokens": 1,
+            "temperature": 0
+          }
+          JSON
+
+          inference_status=$(curl -sS -o models-inference-preflight.json -w "%{http_code}" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${MODELS_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            -H "Content-Type: application/json" \
+            --data @preflight-payload.json \
+            "${inference_url}")
+
+          echo "Models inference preflight HTTP status: ${inference_status}"
+
+          if [ "${inference_status}" != "200" ]; then
+            echo "::error::Inference preflight failed with HTTP ${inference_status}"
+            cat models-inference-preflight.json || true
+            if [ "${inference_status}" = "403" ]; then
+              echo "::error::Token can access catalog but is not authorized for inference/model usage in this repo/org context."
+            fi
+            exit 1
+          fi
+
+      - name: Ask Copilot to say Hello World
+        shell: bash
+        env:
+          MODELS_TOKEN: ${{ secrets.COPILOT_MODELS_TOKEN != '' && secrets.COPILOT_MODELS_TOKEN || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          inference_url="https://models.github.ai/orgs/${GITHUB_REPOSITORY_OWNER}/inference/chat/completions"
+          echo "Inference endpoint: ${inference_url}"
+
+          cat > payload.json <<'JSON'
+          {
+            "model": "openai/gpt-4.1-mini",
+            "messages": [
+              {
+                "role": "user",
+                "content": "Reply with exactly: Hello World"
+              }
+            ],
+            "temperature": 0
+          }
+          JSON
+
+          http_status=$(curl -sS -o response.json -w "%{http_code}" \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${MODELS_TOKEN}" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            -H "Content-Type: application/json" \
+            --data @payload.json \
+            "${inference_url}")
+
+          if [ "${http_status}" != "200" ]; then
+            echo "::error::Models API call failed with HTTP ${http_status}"
+            echo "Response body:"
+            cat response.json
+            exit 1
+          fi
+
+          if [ ! -s response.json ]; then
+            echo "::error::Models API returned an empty response body"
+            exit 1
+          fi
+
+          message=$(python3 - <<'PY'
+          import json
+          with open('response.json', 'r', encoding='utf-8') as f:
+              data = json.load(f)
+          choices = data.get('choices')
+          if not choices:
+              raise SystemExit("ERROR: Missing choices in model response")
+
+          message = choices[0].get('message', {}).get('content', '').strip()
+          if not message:
+              raise SystemExit("ERROR: Empty message content in model response")
+
+          print(message)
+          PY
+          )
+
+          echo "Copilot response: ${message}"
+
+          if [ "${message}" = "Hello World" ]; then
+            echo "✅ Copilot invocation succeeded"
+          else
+            echo "::error::Expected exact response 'Hello World' but got: ${message}"
+            exit 1
+          fi
